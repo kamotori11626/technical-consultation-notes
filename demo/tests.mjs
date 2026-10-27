@@ -1,0 +1,36 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import vm from 'node:vm';
+import {createHandler} from './worker/server.js';
+const assets=Object.fromEntries(await Promise.all(['index.html','demo.html','demo.js','record.js','record-template.js','records.html'].map(async n=>[n,await fs.readFile('public/'+n,'utf8')])));
+class DB{rows=new Map();prepare(sql){return{bind:(key,limit)=>({first:async()=>{if(sql.startsWith('SELECT'))return this.rows.has(key)?{attempts:this.rows.get(key)}:null;const old=this.rows.get(key)||0;if(old>=limit)return null;this.rows.set(key,old+1);return{attempts:old+1};}})};}}
+const env={DB:new DB(),DEMO_USER:'test-user',DEMO_PASSWORD:'test-password',SESSION_SECRET:'test-secret',GEMINI_API_KEY:'test-api'},app=createHandler(assets),origin='https://example.test';
+const req=(path,init={})=>new Request(origin+path,init);
+assert.equal((await app.fetch(req('/'),env)).status,200);
+for(const p of ['/demo','/demo.js','/records.html','/record-template.js','/record.js'])assert.equal((await app.fetch(req(p),env)).status,303);
+for(const p of ['/api/status','/api/records','/api/records/pdf','/api/generate'])assert.equal((await app.fetch(req(p),env)).status,401);
+const post=(path,body,cookie,csrf)=>req(path,{method:'POST',headers:{Origin:origin,'Content-Type':'application/json',...(cookie?{Cookie:cookie}:{}),...(csrf?{'X-CSRF-Token':csrf}:{})},body});
+assert.equal((await app.fetch(req('/login',{method:'POST',body:'username=test-user&password=test-password'}),env)).status,403);
+const invalid=await app.fetch(post('/login','username=test-user&password=wrong'),env);assert.equal(invalid.status,303);assert.match(invalid.headers.get('Location'),/error/);
+const login=await app.fetch(post('/login','username=test-user&password=test-password'),env);assert.equal(login.headers.get('Location'),'/demo');const cookie=login.headers.get('Set-Cookie').split(';')[0];assert.match(login.headers.get('Set-Cookie'),/HttpOnly; Secure; SameSite=Strict/);
+assert.equal((await app.fetch(req('/demo',{headers:{Cookie:cookie}}),env)).status,200);
+const s=await(await app.fetch(req('/api/status',{headers:{Cookie:cookie}}),env)).json();assert.equal(s.remaining,5);assert.ok(s.csrf);assert.equal(JSON.stringify(s).includes('test-api'),false);
+assert.equal((await app.fetch(post('/api/generate','{}',cookie),env)).status,403);
+assert.equal((await app.fetch(post('/api/generate','{}',cookie,s.csrf),env)).status,400);
+assert.equal((await app.fetch(post('/api/generate','x'.repeat(18001),cookie,s.csrf),env)).status,413);
+assert.equal((await app.fetch(req('/demo',{headers:{Cookie:cookie.slice(0,-1)+'z'}}),env)).status,303);
+assert.equal((await app.fetch(req('/data/records.sqlite3',{headers:{Cookie:cookie}}),env)).status,404);
+assert.equal((await app.fetch(req('/.env',{headers:{Cookie:cookie}}),env)).status,404);
+let calls=0;const originalFetch=globalThis.fetch;
+globalThis.fetch=async(url,init)=>{assert.equal(url.includes('gemini-2.5-flash'),true);assert.equal(init.headers['x-goog-api-key'],'test-api');if(url.endsWith(':countTokens'))return new Response(JSON.stringify({totalTokens:100}));calls++;const body=JSON.parse(init.body);assert.equal(body.generationConfig.maxOutputTokens,2048);return new Response(JSON.stringify({candidates:[{finishReason:'STOP',content:{parts:[{text:JSON.stringify({facts:'架空',inference:'推論',unknown:'未確認',memo:'見本'})}]}}]}));};
+const results=await Promise.all(Array.from({length:12},()=>app.fetch(post('/api/generate',JSON.stringify({stage:'memo',prompt:'架空のテスト'}),cookie,s.csrf),env)));
+assert.equal(calls,5);assert.equal(results.filter(r=>r.status===200).length,5);assert.equal(results.filter(r=>r.status===429).length,7);globalThis.fetch=originalFetch;
+const logout=await app.fetch(post('/logout','',cookie),env);assert.match(logout.headers.get('Set-Cookie'),/Max-Age=0/);
+// Test the original DOCX renderer on synthetic data; no real DB is opened.
+const context={window:{},TextEncoder,TextDecoder,Uint8Array,DataView,Blob,atob};vm.createContext(context);vm.runInContext(assets['record-template.js'],context);vm.runInContext(assets['record.js'].slice(assets['record.js'].indexOf('function choiceLine(')),context);
+for(const [input,expected] of [['2026-10-26','令和8年10月26日'],['2026/10/26','令和8年10月26日'],['２０２６年１０月２６日','令和8年10月26日'],['令和８年１０月２６日','令和8年10月26日'],['2019-04-30','平成31年4月30日'],['2019-05-01','令和元年5月1日'],['2024-02-29','令和6年2月29日'],['',''],['未確認','未確認']])assert.equal(context.formatRecordDate(input),expected);
+assert.throws(()=>context.formatRecordDate('2026-02-30'),/右上の日付/);
+context.fixture={displayDate:'2026-10-26',subject:'架空テスト',consultation:'架空の相談',response:'架空の対応',staffOrg:'デモ研究所',staffName:'架空担当者',methods:[],categories:[]};
+const blob=vm.runInContext('buildRecordDocx(fixture)',context);assert.ok(blob.size>10000);assert.equal(context.fixture.displayDate,'2026-10-26');await fs.writeFile('/tmp/recruiting-demo-date-after.docx',new Uint8Array(await blob.arrayBuffer()));
+assert.equal(Buffer.from(await blob.arrayBuffer()).includes(Buffer.from('令和8年10月26日')),true);
+console.log('PASS: authentication, CSRF, protected assets/API, secret/data exclusion, 5-call concurrent limit, DOCX generation');

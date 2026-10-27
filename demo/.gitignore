@@ -1,0 +1,9 @@
+dist/
+.env*
+!.env.example
+node_modules/
+.wrangler/
+*.tar.gz
+__pycache__/
+
+worker/index.js

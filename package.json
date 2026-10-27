@@ -1,0 +1,11 @@
+{
+  "name": "technical-consultation-notes",
+  "private": true,
+  "description": "個人試作の技術相談メモ支援ツールと採用向けデモ",
+  "scripts": {
+    "test": "npm --prefix demo test && node local-app/tests/gemini-client.cjs && node local-app/tests/record-export.cjs",
+    "audit": "python3 scripts/audit_repository.py --history",
+    "build": "npm --prefix demo run build && npm --prefix demo run validate"
+  },
+  "engines": { "node": ">=22" }
+}
